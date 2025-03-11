@@ -1,12 +1,12 @@
 import numpy as np
+import os
 import pandas as pd
-import streamlit as st
 from sqlalchemy import text
 from sqlalchemy.exc import ProgrammingError
 import traceback
 
-START_YEAR = int(st.secrets["START_YEAR"])
-YEARS_PER_SIMULATION = int(st.secrets["YEARS_PER_SIMULATION"])
+START_YEAR = int(os.getenv("START_YEAR"))
+YEARS_PER_SIMULATION = int(os.getenv("YEARS_PER_SIMULATION"))
 
 def create_storage_schemas(engine, sim_name) -> None:
 
@@ -14,11 +14,8 @@ def create_storage_schemas(engine, sim_name) -> None:
         #add primary key to player_table
         con.execute(text(f'create schema raw_{sim_name}'))
         con.execute(text(f'create schema stage_{sim_name}'))
+        con.execute(text(f'create schema warehouse_{sim_name}'))
         con.execute(text(f'create schema mart_{sim_name}'))
-        #replicate an asset table since it is simulation unique
-        con.execute(text(f'select * into raw_{sim_name}.asset_table from initial_game_setups.asset_table'))
-        #create a table that tracks player input
-        con.execute(text(f'create table raw_{sim_name}.input_progress(player text,round int)'))
         try:
             con.commit()
         except ProgrammingError as e:
@@ -90,7 +87,7 @@ def get_asset_table(engine, sim_name):
         f"""
         select 
             *
-        from raw_{sim_name}.asset_table
+        from mart_{sim_name}.dim_asset_table
         """
     )
 
@@ -117,8 +114,8 @@ def get_current_round(engine, sim_name):
         from 
             all_sim_gen_tables
         where 
-            schema_name = 'raw_{sim_name}' and
-            table_name like 'simulation_result%'
+            schema_name = 'mart_{sim_name}' and
+            table_name like 'fct_asset_result_%'
         """
     )
 
@@ -192,7 +189,8 @@ def get_player_description(engine, player):
 
 def get_existing_asset_summary(engine, player, view_round, selected_sim):
     view_year = START_YEAR + (view_round)*YEARS_PER_SIMULATION
-    schema = 'initial_game_setups' if selected_sim is None else f'raw_{selected_sim}'
+    schema = 'initial_game_setups' if selected_sim is None else f'mart_{selected_sim}'
+    table = 'asset_table' if selected_sim is None else 'dim_asset_table'
     query = text(
         f"""
         with generation_capacity as(
@@ -200,7 +198,7 @@ def get_existing_asset_summary(engine, player, view_round, selected_sim):
                 asset_type as "Asset Type",
                 sum(generation_capacity) as "Capacity", 
                 'Yes' as "Established"
-            from {schema}.asset_table
+            from {schema}.{table}
             where 
                 player = '{player}' and 
                 asset_type != 'Battery' and
@@ -211,7 +209,7 @@ def get_existing_asset_summary(engine, player, view_round, selected_sim):
                 asset_type as "Asset Type",
                 sum(storage_capacity) as "Capacity", 
                 'Yes' as "Established"
-            from {schema}.asset_table
+            from {schema}.{table}
             where
                 player = '{player}' and 
                 asset_type != 'Battery' and
@@ -244,7 +242,7 @@ def get_sim_input_capacity(engine, sim_name, current_year, generation = True):
             vom,
             fuel_cost,
             end_year
-        from raw_{sim_name}.asset_table
+        from mart_{sim_name}.dim_asset_table
         where asset_type {type_condition} 'Battery'
         """
     )
@@ -263,7 +261,7 @@ def get_sim_input_capacity(engine, sim_name, current_year, generation = True):
 
     return capacity_dict, vom_dict, fuel_cost_dict
 
-def get_sim_input_profiles(engine, profile_type, sample_year):
+def get_sim_input_profiles(engine, profile_type, sim_name):
     
     if profile_type not in ['demand', 'solar', 'wind']:
         raise ValueError("Profile are only available in 'demand', 'solar' or 'wind'")
@@ -272,8 +270,7 @@ def get_sim_input_profiles(engine, profile_type, sample_year):
         f"""
         select
             value
-        from initial_game_setups.{profile_type}_profile
-        where year = {sample_year}
+        from stage_{sim_name}.stg_{profile_type}_profile
         """
     )
 
@@ -283,12 +280,12 @@ def get_sim_input_profiles(engine, profile_type, sample_year):
     profile_dict = pd.Series(table.value.values, index = np.arange(1, len(table)+1)).to_dict()
     return profile_dict
 
-def get_reporting_table(engine, sim_name, round):
+def get_financial_reporting_table(engine, sim_name, round):
     
     query = text(
         f"""
         select *
-        from mart_{sim_name}.reporting_sim_result_{round}
+        from mart_{sim_name}.rpt_financial_outcome_summary_{round}
         """
     )
 
@@ -296,6 +293,43 @@ def get_reporting_table(engine, sim_name, round):
         table = pd.read_sql(sql = query, con = con)
 
     return table
+
+def get_emission_outcome(engine, sim_name, round):
+    query = text(
+        f"""
+        select 
+            player,
+            sum(case
+                when asset_type = 'Gas' then summed_value_mwh * 0.6 --Emission intensity for Gas
+                when asset_type = 'Coal' then summed_value_mwh * 1.5 --Emission intensity for Coal
+                else 0
+            end) as total_emission_Tco2
+        from [mart_{sim_name}].[rpt_asset_outcome_summary_{round}]
+        group by player
+        """
+    )
+
+    with engine.connect() as con:
+        table = pd.read_sql(sql = query, con = con)
+
+    return table
+
+def get_player_mw_capacity(engine, sim_name, player, round):
+    query = text(
+        f"""
+        select 
+            sum(summed_value_mwh) as total_mwh
+        from [mart_{sim_name}].[rpt_asset_outcome_summary_{round}]
+        where
+            asset_type != 'Battery' and
+            player = '{player}'
+        """
+    )
+
+    with engine.connect() as con:
+        table = pd.read_sql(sql = query, con = con)
+
+    return table.total_mwh[0]
 
 def get_target_table(engine):
     query = text(
@@ -311,6 +345,8 @@ def get_target_table(engine):
     return table
 
 def get_investment_capacity_summary_table(engine, sim_name, view_year):
+    schema = 'initial_game_setups' if sim_name is None else f'mart_{sim_name}'
+    table = 'asset_table' if sim_name is None else 'dim_asset_table'
     query = text(
         f"""
         with asset_summary as (
@@ -323,7 +359,7 @@ def get_investment_capacity_summary_table(engine, sim_name, view_year):
                             when asset_type != 'Battery' then generation_capacity
                         end
                     ) as summed_capacity
-                from {sim_name}.asset_table
+                from {schema}.{table}
                 where 
                     start_year < {view_year}
                 group by asset_type, start_year
@@ -341,3 +377,57 @@ def get_investment_capacity_summary_table(engine, sim_name, view_year):
         table = pd.read_sql(sql = query, con = con)
 
     return table
+
+def get_grouped_dispatch_result(engine, sim_name, round, date_range):
+    query = text(
+        f"""
+        select *
+        from [mart_{sim_name}].[rpt_grouped_dispatch_detail_{round}]
+        where
+            value_type != 'q_st' and
+            datetime >= '{str(date_range[0])}' and
+            datetime <= '{str(date_range[1])}'
+        """
+    )
+
+    with engine.connect() as con:
+        table = pd.read_sql(sql = query, con = con)
+
+    return table
+
+def get_market_price(engine, sim_name, round, date_range):
+    query = text(
+        f"""
+        select *
+        from [mart_{sim_name}].[fct_mkt_result_{round}]
+        where
+            value_type = 'price' and
+            datetime >= '{str(date_range[0])}' and
+            datetime <= '{str(date_range[1])}'
+        """
+    )
+
+    with engine.connect() as con:
+        table = pd.read_sql(sql = query, con = con)
+
+    table = table.set_index(pd.to_datetime(table.datetime))
+    return table['value']
+
+def get_market_demand(engine, sim_name, round, date_range):
+    query = text(
+        f"""
+        select *
+        from [mart_{sim_name}].[fct_mkt_result_{round}]
+        where
+            value_type = 'demand' and
+            datetime >= '{str(date_range[0])}' and
+            datetime <= '{str(date_range[1])}'
+        """
+    )
+
+    with engine.connect() as con:
+        table = pd.read_sql(sql = query, con = con)
+
+    table = table.set_index(pd.to_datetime(table.datetime))
+    table = table.sort_index()
+    return table['value']
